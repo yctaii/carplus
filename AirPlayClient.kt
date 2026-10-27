@@ -1347,6 +1347,10 @@ class AirPlayClient(
     var mib3ControlSessionDone: Boolean = false
         private set
 
+    /** 隧道事件通道是否已见过车机 FF5A 帧（若此后控制会话未完成却重现 FF55 marker，说明车机复位了隧道链路）。 */
+    @Volatile
+    private var tunnelSawSyncOrData: Boolean = false
+
     /** 虚拟链路唯一实例（出站路由/三形态语义见 [VirtualIap2Link]）。 */
     private fun obtainIapLink(): VirtualIap2Link =
         iapLink ?: synchronized(this) {
@@ -1357,6 +1361,7 @@ class AirPlayClient(
                     sendControlIap = ::postControlIap,
                     tunnelWriter = { iapTunnel },
                     alive = { socket?.isClosed == false },
+                    mfiContext = context,
                 ).also {
                     it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
                     it.onNavKey = { keyCode -> onNavKey?.invoke(keyCode) }
@@ -1371,6 +1376,21 @@ class AirPlayClient(
 
     /** 车机 iAPSendMessage 字节入口（SessionController 事件命令处理器调用）。 */
     fun onIapEventBytes(data: ByteArray) {
+        val isMarker = data.size == 6 && data[0] == 0xFF.toByte() && data[1] == 0x55.toByte()
+        if (!isMarker && data.size >= 9 && data[0] == 0xFF.toByte() && data[1] == 0x5A.toByte()) {
+            tunnelSawSyncOrData = true
+        } else if (isMarker && tunnelSawSyncOrData && !mib3ControlSessionDone && iapTunnel == null) {
+            log("IAPLINK: 隧道控制会话未完成时车机重发 FF55 marker（车机复位隧道链路）——重建虚拟链路重协商")
+            synchronized(this) {
+                iapLink = null
+                tunnelSawSyncOrData = false
+            }
+            val link = obtainIapLink()
+            link.setGeneration(linkGeneration ?: ReceiverProfile.LinkGeneration.EVENT_LINK)
+            link.armMib3()
+            link.onCarBytes(data)
+            return
+        }
         obtainIapLink().onCarBytes(data)
     }
 

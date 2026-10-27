@@ -113,6 +113,9 @@ class Iap2SenderSession(
     private var availabilityAttempt = 0
     private var linkRehandshakeCount = 0
 
+    /** 0x1D01 参数 17（BluetoothTransportComponent）中的组件 ID 列表（如别克 CinemoBTComponent id=2）。 */
+    private var btTransportComponentIds: List<Int> = emptyList()
+
     /**
      * 0x1D01 参数 6：车机声明「它可发送」的消息 ID 清单。
      * 用它判断 0x6800 (StartHID) / 0x4301 是否真的会来——声明里没有就不该盲等：
@@ -532,6 +535,8 @@ class Iap2SenderSession(
         // 逐条打日志会把文件日志撑爆（文件超 2MB 直接删，等于丢掉真正有用的上下文）。
         var lastLoggedId = -1
         var repeatCount = 0
+        var idleTicksWithoutStartSession = 0
+        var keepAliveAvailabilityResent = 0
         while (true) {
             if (channel.consumePeerReset() && linkRehandshakeCount < 3) {
                 val reDeadline = System.nanoTime() + 25_000_000_000L
@@ -540,6 +545,18 @@ class Iap2SenderSession(
             val frame = recvFrame(2_000L)
             if (frame == null) {
                 if (!channel.isAlive) break
+                if (!startSessionRawLogged &&
+                    accessoryDeclaresSend(Iap2MessageIds.CARPLAY_START_SESSION) == true &&
+                    btTransportComponentIds.isNotEmpty() &&
+                    keepAliveAvailabilityResent < 5
+                ) {
+                    idleTicksWithoutStartSession++
+                    if (idleTicksWithoutStartSession % 2 == 0) {
+                        keepAliveAvailabilityResent++
+                        log("iap2 保活期等待 0x4301——补发第 $keepAliveAvailabilityResent 次 0x4300 CarPlayAvailability")
+                        runCatching { sendCarPlayAvailability() }
+                    }
+                }
                 continue
             }
             // 生命周期消息必须先于日志限流处理：0x4301 可能作为「车机刚打开 CarPlay
@@ -701,6 +718,11 @@ class Iap2SenderSession(
             }
             if (gotResponse) {
                 MfiLengthMemory.recordSuccess(context, receiverKey, size)
+                // 同步预热 AirPlay 隧道侧同车机的 MFi 长度记忆（VirtualIap2Link 使用 "$identity tunnel" 键）：
+                // 别克 E2YB（Cinemo AuthV3）实测蓝牙侧 32B 秒过，但隧道侧冷启动基线发 20B 会导致车机 100ms 内
+                // 复位隧道链路并在 10s 看门狗到期后拆掉整条 CarPlay 会话（2026-10-27 130556 日志定谳）。
+                MfiLengthMemory.recordSuccess(context, "$receiverKey tunnel", size)
+                MfiLengthMemory.recordSuccess(null, "$receiverKey tunnel", size)
                 return
             }
             if (gotFailure) {
@@ -749,6 +771,14 @@ class Iap2SenderSession(
             Iap2MessageIds.DEVICE_UUID_UPDATE,
             Iap2Csm.string(0, deviceUuid()),
         )
+        if (btTransportComponentIds.isNotEmpty() && accessoryDeclaresReceive(0x4C01) == true) {
+            val groups =
+                btTransportComponentIds
+                    .map { id -> Iap2Csm.group(0, Iap2Csm.u16(0, id), Iap2Csm.u8(1, 1)) }
+                    .reduce { acc, bytes -> acc + bytes }
+            sendFireAndForget(0x4C01, groups)
+            log("iap2 tx=0x4c01 BluetoothComponentInformation（enabled=1 ids=$btTransportComponentIds）")
+        }
         log(
             "iap2 tx=${if (skipWirelessUpdate) "" else "0x4e0d/"}0x4e0a/0x4e09/0x4e0b/0x4e0c 设备状态问候" +
                 "（name=$deviceName mac=$bluetoothMac）",
@@ -764,14 +794,22 @@ class Iap2SenderSession(
      */
     private fun sendCarPlayAvailability() {
         val attempt = availabilityAttempt++
+        val fullThreeGroups =
+            Iap2Csm.group(0, Iap2Csm.u8(0, 1)) +
+                Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)) +
+                Iap2Csm.group(2, Iap2Csm.u8(0, 1))
         val payload =
-            when (attempt) {
-                0 -> Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac))
-                1 ->
-                    Iap2Csm.group(0, Iap2Csm.u8(0, 1)) +
-                        Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)) +
-                        Iap2Csm.group(2, Iap2Csm.u8(0, 1))
-                else -> Iap2Csm.group(1, Iap2Csm.u8(0, 1))
+            if (btTransportComponentIds.isNotEmpty()) {
+                when (attempt % 3) {
+                    0, 1 -> fullThreeGroups
+                    else -> Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac))
+                }
+            } else {
+                when (attempt) {
+                    0 -> Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac))
+                    1 -> fullThreeGroups
+                    else -> Iap2Csm.group(1, Iap2Csm.u8(0, 1))
+                }
             }
         sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, payload)
     }
@@ -1122,7 +1160,23 @@ class Iap2SenderSession(
     }
 
     private fun logIdentification(frame: Iap2Csm.Frame) {
-        val params = Iap2Csm.parseParams(frame.body).associateBy { it.id }
+        val rawParams = Iap2Csm.parseParams(frame.body)
+        val params = rawParams.associateBy { it.id }
+        val btCompIds =
+            rawParams
+                .filter { it.id == 17 }
+                .mapNotNull { group ->
+                    val sub = Iap2Csm.parseParams(group.value).associateBy { it.id }
+                    val idBytes = sub[0]?.value
+                    if (idBytes != null && idBytes.size == 2) {
+                        ((idBytes[0].toInt() and 0xFF) shl 8) or (idBytes[1].toInt() and 0xFF)
+                    } else {
+                        null
+                    }
+                }
+        if (btCompIds.isNotEmpty()) {
+            btTransportComponentIds = btCompIds
+        }
         val name = params[0]?.value?.asStringOrEmpty()
         val model = params[1]?.value?.asStringOrEmpty()
         val manufacturer = params[2]?.value?.asStringOrEmpty()

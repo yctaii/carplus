@@ -1694,13 +1694,13 @@ object SessionController {
             val identity = client.receiverIdentity()
             // 音频封装参数已定案（见 AudioTuning），不再提供切换
             val tuning = AudioTuning.RAW_SPF
-            val entry = AudioProfileMemory.load(context.applicationContext, identity)
-            if (entry.disabled) {
-                // 以前「全部档位都导致拆链」会自动退成只推视频，并要用户去弹窗里手点
-                // 「清除记忆」。现在音频通路已换成 AAC-LC 且实测能稳定跑满 147s，
-                // 旧结论不再可信：用户既然主动选了「开启声音」，就直接清记忆重试。
+            var entry = AudioProfileMemory.load(context.applicationContext, identity)
+            if (entry.disabled || (entry.working == null && entry.rejected.isNotEmpty())) {
+                // 以前「全部档位都导致拆链」或「隧道 10s 看门狗拆链误记到首档音频头上」会把首选
+                // t102/AAC-LC 档位拉黑。只要还没有验证成功的 working 档位，重连时自动清记忆重试首选档。
                 AudioProfileMemory.clearAll(context.applicationContext)
-                appendLog("AUDIO: 本车机（$identity）有「全部档位拆链」的旧记忆，已自动清除并重试")
+                entry = AudioProfileMemory.load(context.applicationContext, identity)
+                appendLog("AUDIO: 本车机（$identity）有未验证成功的拆链旧记忆，已自动清除并重试首选档位")
             }
             val candidates = client.audioCandidates(preferCompat = audioPreferCompat)
             val ordered = AudioProfileMemory.order(candidates, entry)
@@ -2331,6 +2331,58 @@ object SessionController {
                             "AIRPLAY: 并入交接期间晚到的 0x4301 端点 → " +
                                 "${effectiveEndpoint.ipAddresses.firstOrNull()}:${effectiveEndpoint.airPlayPort}",
                         )
+                    }
+                    // 新协议车机（别克 E2YB / GM Cinemo 等 EVENT_LINK 代际）在未收到 0x4301 且 mDNS 无
+                    // _airplay._tcp 时，若直接拿 IPv4 网关（如 10.84.74.193:7000）抢跑 SETUP，车机会回
+                    // 500 Internal Server Error 并弹窗报错（车机真正的会话端点只在 0x4301 的 IPv6 地址上开放）。
+                    // 此时网络已绑定且 _carplay-ctrl 已广播，原地等 0x4301 晚到热更新即可，不抢跑网关 SETUP。
+                    if (endpoint.ipAddresses.isEmpty() &&
+                        effectiveEndpoint.deviceIdentifier == null &&
+                        effectiveEndpoint.publicKey == null &&
+                        senderLinkGeneration() == ReceiverProfile.LinkGeneration.EVENT_LINK
+                    ) {
+                        phaseHint = "蓝牙与热点已就绪，等待车机下发 CarPlay 会话（若车机弹窗请点重试）…"
+                        appendLog(
+                            "AIRPLAY: 新协议车机尚未下发 0x4301（且无 mDNS _airplay._tcp）——" +
+                                "已绑定热点并广播 _carplay-ctrl，等待 0x4301 到达后再发起连接（避免网关抢跑触发 500）",
+                        )
+                        val waitUntil = android.os.SystemClock.uptimeMillis() + 15_000L
+                        var nextAnnounceAt = android.os.SystemClock.uptimeMillis() + 3_000L
+                        while (!connectCancelled && android.os.SystemClock.uptimeMillis() < waitUntil) {
+                            val late = pendingEndpointUpdate
+                            if (late != null) {
+                                pendingEndpointUpdate = null
+                                effectiveEndpoint = preferEndpoint(late, effectiveEndpoint)
+                                appendLog(
+                                    "AIRPLAY: ✓ 等待期间收到 0x4301 → " +
+                                        "${effectiveEndpoint.ipAddresses.firstOrNull()}:${effectiveEndpoint.airPlayPort}",
+                                )
+                                break
+                            }
+                            val mdns = endpointBrowser?.awaitEndpoint(0)
+                            if (mdns != null) {
+                                effectiveEndpoint = mergeBrowserEndpoint(effectiveEndpoint, mdns, source, needPort = true)
+                                break
+                            }
+                            val now = android.os.SystemClock.uptimeMillis()
+                            if (now >= nextAnnounceAt) {
+                                nextAnnounceAt = now + 3_000L
+                                ctrlAdvertiser?.ensureForNetwork(
+                                    endpoint.ssid,
+                                    force = true,
+                                    network = wifiConnector?.currentNetwork,
+                                )
+                            }
+                            Thread.sleep(250)
+                        }
+                        if (effectiveEndpoint.deviceIdentifier == null &&
+                            effectiveEndpoint.publicKey == null &&
+                            effectiveEndpoint.ipAddresses.all { EndpointHosts.isIpv4(it) }
+                        ) {
+                            appendLog("AIRPLAY: 15s 内仍未收到 0x4301——保持蓝牙与热点在位，待 0x4301 到达后自动拉起")
+                            sessionStarting.set(false)
+                            return@run
+                        }
                     }
                     if (connectCancelled) {
                         appendLog("AIRPLAY: 用户已取消——中止配对")

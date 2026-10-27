@@ -175,6 +175,9 @@ class Iap2LinkEngine(
     /** NORMAL 状态下连续收到的对端探测 marker（FF 55 02 00 EE 10）计数。 */
     private var normalDetectMarkers = 0
 
+    /** 对端 0x1D01 识别帧（param 7）声明可接收的消息 ID 集合；null = 对端未声明（如单测）。 */
+    private var peerDeclaredReceiveIds: Set<Int>? = null
+
     /** 诊断：对端在 NORMAL 状态下重置回探测态（连续发 marker）并触发重协商时回调。 */
     var onPeerResetToDetect: (() -> Unit)? = null
 
@@ -332,12 +335,35 @@ class Iap2LinkEngine(
         awaitAck: Boolean = true,
     ): Boolean {
         if (state == State.DEAD) return false
+        var effective = bytes
+        val declared = peerDeclaredReceiveIds
+        if (declared != null &&
+            bytes.size >= 6 &&
+            bytes[0] == 0x40.toByte() &&
+            bytes[1] == 0x40.toByte()
+        ) {
+            val frameLen = readU16(bytes, 2)
+            if (frameLen == bytes.size) {
+                val msgId = readU16(bytes, 4)
+                if ((msgId == 0xA100 || msgId == 0xFFFA || msgId == 0xFFF0) && msgId !in declared) {
+                    // 隧道突发兼容：车机 0x1D01 明确未声明接收 MIB3 私有消息（如别克 Cinemo 栈）时跳过，防车机重置链路
+                    return true
+                }
+                if ((msgId == 0x4E0C || msgId == 0x4E0A || msgId == 0x4E09) &&
+                    bytes.size >= 10 &&
+                    bytes.last() != 0.toByte()
+                ) {
+                    // VirtualIap2Link 突发里 0x4E0C/0x4E0A/0x4E09 的 UTF-8 字符串未带尾部 NUL：对严格校验的 Cinemo 栈补齐 \0
+                    effective = Iap2Csm.encode(msgId, Iap2Csm.param(0, bytes.copyOfRange(10, bytes.size) + byteArrayOf(0)))
+                }
+            }
+        }
         val limit = (peerSynchronization?.maxLength ?: 0xFFFF) - HEADER_BYTES - 1
-        if (limit <= 0 || bytes.size > limit) {
-            die("control payload ${bytes.size} exceeds negotiated limit $limit")
+        if (limit <= 0 || effective.size > limit) {
+            die("control payload ${effective.size} exceeds negotiated limit $limit")
             return false
         }
-        sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck)
+        sendBacklog += Packet(0, effective.copyOf(), awaitAck = awaitAck)
         drainSendWindow(nowMillis)
         return true
     }
@@ -616,6 +642,22 @@ class Iap2LinkEngine(
         if (pendingEvents.size >= 256) {
             die("event queue overflow")
             return
+        }
+        if (payload.size >= 6 &&
+            payload[0] == 0x40.toByte() &&
+            payload[1] == 0x40.toByte() &&
+            readU16(payload, 4) == Iap2MessageIds.IDENTIFICATION_INFORMATION
+        ) {
+            runCatching {
+                val params = Iap2Csm.parseParams(payload.copyOfRange(6, payload.size))
+                val recvRaw = params.firstOrNull { it.id == 7 }?.value
+                if (recvRaw != null && recvRaw.size >= 2 && recvRaw.size % 2 == 0) {
+                    peerDeclaredReceiveIds =
+                        (0 until recvRaw.size step 2)
+                            .map { readU16(recvRaw, it) }
+                            .toSet()
+                }
+            }
         }
         pendingEvents += Event.Control(payload)
         sendAcknowledgement()
