@@ -354,12 +354,9 @@ class Iap2LinkEngine(
                 if (isMarkerAtHead()) {
                     receive.discard(MARKER.size)
                     if (state == State.NORMAL) {
-                        normalDetectMarkers++
-                        if (normalDetectMarkers >= 2) {
-                            normalDetectMarkers = 0
-                            renegotiateAfterPeerDetect(nowMillis)
-                            return false
-                        }
+                        normalDetectMarkers = 0
+                        renegotiateAfterPeerDetect(nowMillis)
+                        return false
                     }
                     continue
                 }

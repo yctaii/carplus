@@ -39,6 +39,9 @@ class Iap2LinkChannel(
 
     val isAlive: Boolean get() = !terminated
 
+    /** 对端是否触发了探测态重协商（不消费标志）。 */
+    fun hasPeerReset(): Boolean = synchronized(lock) { peerResetCount > 0 }
+
     /** 消费一次「对端重置回探测态」信号。 */
     fun consumePeerReset(): Boolean =
         synchronized(lock) {
@@ -50,10 +53,30 @@ class Iap2LinkChannel(
             }
         }
 
+    /** 等待链路回到 NORMAL 态（对端复位后二次协商完成）。 */
+    fun awaitNormal(timeoutMillis: Long): Boolean {
+        val deadline = nowMillis() + timeoutMillis
+        synchronized(lock) {
+            while (!terminated && engine.state != Iap2LinkEngine.State.NORMAL) {
+                val remaining = deadline - nowMillis()
+                if (remaining <= 0) return false
+                try {
+                    lock.wait(remaining)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
+            }
+            return !terminated && engine.state == Iap2LinkEngine.State.NORMAL
+        }
+    }
+
     init {
         engine.onPeerResetToDetect = {
             peerResetCount++
-            log("LINK: 检测到对端连续发 FF55 探测 marker（车机侧链路已复位）——已回发 marker+SYN 重开链路协商")
+            controls.offer(WAKEUP)
+            lock.notifyAll()
+            log("LINK: 检测到对端发 FF55 探测 marker（车机侧链路已复位）——已回发 marker+SYN 重开链路协商并唤醒会话层")
         }
         engine.onPeerSynchronizationAdopted = { sync ->
             log(
@@ -125,7 +148,7 @@ class Iap2LinkChannel(
                 Thread.currentThread().interrupt()
                 return null
             }
-        return if (polled === null || polled === POISON) null else polled
+        return if (polled === null || polled === POISON || polled === WAKEUP) null else polled
     }
 
     override fun close() {
@@ -242,9 +265,12 @@ class Iap2LinkChannel(
     }
 
     private fun signalReadyLocked() {
-        if (!readySignalled && engine.state == Iap2LinkEngine.State.NORMAL) {
-            readySignalled = true
-            readyLatch.countDown()
+        if (engine.state == Iap2LinkEngine.State.NORMAL) {
+            if (!readySignalled) {
+                readySignalled = true
+                readyLatch.countDown()
+            }
+            lock.notifyAll()
         }
     }
 
@@ -283,5 +309,8 @@ class Iap2LinkChannel(
 
         /** 链路终结哨兵；真实控制载荷至少包含一段 CSM 帧，不会为空。 */
         val POISON = ByteArray(0)
+
+        /** 链路复位唤醒哨兵（提前打断阻塞等待 0x4301 的 recvControl）。 */
+        val WAKEUP = ByteArray(0)
     }
 }

@@ -150,8 +150,13 @@ class Iap2SenderSession(
     private fun accessoryDeclaresReceive(messageId: Int): Boolean? = if (!receiveListDeclared) null else messageId in accessoryReceiveIds
 
     private companion object {
-        /** 等 StartHID 的窗口：xcertplay 会发（订阅后立即到），DiPlay 不发。 */
-        const val HID_WAIT_NANOS = 2_000_000_000L
+        /**
+         * 等 StartHID 的窗口：xcertplay/测试台在问候后数毫秒内即发；
+         * 别克/凯迪拉克（GM Cinemo）虽在 0x1D01 声明 0x6800，但仅在媒体会话建立后才发，
+         * 若在此处阻塞满 2s 会导致 0xAA05→0x4300 间隔超过车机 2s 看门狗而触发链路复位。
+         * 因此窗口缩短到 150ms，且后续 expectOrNull 期间若迟到 0x6800 也即时应答 0x6801。
+         */
+        const val HID_WAIT_NANOS = 150_000_000L
 
         /**
          * 等 0x4301 的短窗口（声明会发的测试台毫秒级应答；没声明的车机直接跳过）。
@@ -187,7 +192,22 @@ class Iap2SenderSession(
         private val MFI_ATTEMPTS = listOf(32 to 3_000L, 20 to 6_000L, 16 to 3_000L)
 
         /** 真车系接收端特征（0x1D01 name/model/manufacturer 子串，小写比对）。 */
-        private val LEGACY_RECEIVER_MARKERS = listOf("audi", "delphi", "mib", "harman", "porsche")
+        private val LEGACY_RECEIVER_MARKERS =
+            listOf(
+                "audi",
+                "delphi",
+                "mib",
+                "harman",
+                "porsche",
+                "buick",
+                "saic",
+                "general motors",
+                "sgm",
+                "chevrolet",
+                "cadillac",
+                "cinemo",
+                "e2yb",
+            )
     }
 
     /** 从 0x1D01 提取接收端身份文本（name/model/manufacturer 小写拼接）——MFi 挑战长度选择用。 */
@@ -711,7 +731,12 @@ class Iap2SenderSession(
     private fun sendDeviceStateGreetings(force: Boolean = false) {
         if (greetingsSent && !force) return
         greetingsSent = true
-        send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
+        val skipWirelessUpdate =
+            linkRehandshakeCount > 0 &&
+                accessoryDeclaresReceive(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE) == false
+        if (!skipWirelessUpdate) {
+            send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
+        }
         send(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2Csm.string(0, "zh-CN"))
         send(Iap2MessageIds.DEVICE_INFORMATION_UPDATE, Iap2Csm.string(0, deviceName))
         val epochSeconds = System.currentTimeMillis() / 1000L
@@ -730,7 +755,7 @@ class Iap2SenderSession(
             Iap2Csm.string(0, deviceUuid()),
         )
         log(
-            "iap2 tx=0x4e0d/0x4e0a/0x4e09/0x4e0b/0x4e0c 设备状态问候" +
+            "iap2 tx=${if (skipWirelessUpdate) "" else "0x4e0d/"}0x4e0a/0x4e09/0x4e0b/0x4e0c 设备状态问候" +
                 "（name=$deviceName mac=$bluetoothMac）",
         )
     }
@@ -762,8 +787,13 @@ class Iap2SenderSession(
      */
     private fun reidentifyAfterLinkReset(deadline: Long): Boolean {
         linkRehandshakeCount++
-        log("iap2 检测到车机重置链路层（第 $linkRehandshakeCount 次）——在新协商链路上重跑识别与认证")
+        log("iap2 检测到车机重置链路层（第 $linkRehandshakeCount 次）——等待二次 SYN 协商完成后重跑识别与认证")
         return try {
+            if (!channel.awaitNormal(minOf(remainingMillis(deadline), 3_000L))) {
+                log("iap2 链路复位后等待二次 SYN 协商完成超时")
+                return false
+            }
+            pendingFrames.clear()
             send(Iap2MessageIds.START_IDENTIFICATION)
             val identification = expectOrNull(Iap2MessageIds.IDENTIFICATION_INFORMATION, wifiRescueDeadline(deadline, 5_000L)) ?: return false
             logIdentification(identification)
@@ -779,10 +809,12 @@ class Iap2SenderSession(
             log("iap2 tx=0xaa05 authentication-succeeded（重协商自报）")
             sendDeviceStateGreetings(force = true)
             sendCarPlayAvailability()
-            sendFireAndForget(
-                Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
-                Iap2Csm.string(0, bluetoothMac),
-            )
+            if (accessoryDeclaresReceive(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER) != false) {
+                sendFireAndForget(
+                    Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
+                    Iap2Csm.string(0, bluetoothMac),
+                )
+            }
             true
         } catch (e: IOException) {
             log("iap2 链路复位后重识别中断 - ${e.message}")
@@ -807,7 +839,7 @@ class Iap2SenderSession(
                 else -> body.reduce { acc, bytes -> acc + bytes }
             }
         val frame = Iap2Csm.encode(messageId, joined)
-        val limit = channel.peerMaxControlPayload() ?: (frame.size - 1).coerceAtLeast(1)
+        val limit = channel.peerMaxControlPayload() ?: frame.size.coerceAtLeast(1)
         var offset = 0
         while (offset < frame.size) {
             val end = minOf(offset + limit, frame.size)
@@ -825,7 +857,7 @@ class Iap2SenderSession(
         body: ByteArray,
     ) {
         val frame = Iap2Csm.encode(messageId, body)
-        val limit = channel.peerMaxControlPayload() ?: (frame.size - 1).coerceAtLeast(1)
+        val limit = channel.peerMaxControlPayload() ?: frame.size.coerceAtLeast(1)
         var offset = 0
         while (offset < frame.size) {
             val end = minOf(offset + limit, frame.size)
@@ -864,10 +896,19 @@ class Iap2SenderSession(
             if (remaining <= 0) return null
             val frame = recvNewFrame(remaining)
             if (frame == null) {
-                if (!channel.isAlive) return null
+                if (!channel.isAlive || channel.hasPeerReset()) return null
                 continue
             }
             if (frame.messageId == messageId) return frame
+            if (frame.messageId == Iap2MessageIds.START_HID) {
+                log("iap2 rx=0x6800 start-hid bytes=${frame.body.size}（等待期间即时应答 0x6801）")
+                send(
+                    Iap2MessageIds.DEVICE_HID_REPORT,
+                    Iap2Csm.u16(0, 0),
+                    Iap2Csm.param(1, byteArrayOf(0)),
+                )
+                continue
+            }
             log(
                 "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +
                     "(${Iap2MessageIds.nameOf(frame.messageId)})，非预期，暂存待后续消费",
