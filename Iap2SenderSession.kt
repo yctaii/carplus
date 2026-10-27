@@ -199,14 +199,6 @@ class Iap2SenderSession(
                 "mib",
                 "harman",
                 "porsche",
-                "buick",
-                "saic",
-                "general motors",
-                "sgm",
-                "chevrolet",
-                "cadillac",
-                "cinemo",
-                "e2yb",
             )
     }
 
@@ -659,9 +651,12 @@ class Iap2SenderSession(
         }
         for ((position, size) in order.withIndex()) {
             // 已知「静默过」的档位缩短窗口：它已经失败过一次，没必要再等满。
+            // 但若全部档位都被记为静默且无成功记录（如上一轮首档长度不对导致车机链路假死，
+            // 连带后续档位一并超时），首档必须恢复完整窗口。
+            val allPoisonedSilent = memory.succeeded == null && memory.silent.size >= baselineLengths.size
             val baseWindow = windowOf[size] ?: MFI_ATTEMPTS.last().second
             val windowMillis =
-                if (size in memory.silent && size != memory.succeeded) {
+                if (!allPoisonedSilent && size in memory.silent && size != memory.succeeded) {
                     minOf(baseWindow, MFI_SILENT_RETRY_WINDOW_MS)
                 } else {
                     baseWindow
@@ -794,6 +789,7 @@ class Iap2SenderSession(
                 return false
             }
             pendingFrames.clear()
+            receivedFrames.clear()
             send(Iap2MessageIds.START_IDENTIFICATION)
             val identification = expectOrNull(Iap2MessageIds.IDENTIFICATION_INFORMATION, wifiRescueDeadline(deadline, 5_000L)) ?: return false
             logIdentification(identification)
