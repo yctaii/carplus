@@ -1,103 +1,43 @@
-# CarDeck 自动构建（Fork 自用版）
-#
-# 与原作者版本的区别：
-#   - 不需要任何签名 Secrets，使用 Android 自带的 debug 证书签名；
-#   - 构建 standard 变体的 Debug APK（项目有 standard/remote 两个 flavor，
-#     产物在 app/build/outputs/apk/standard/debug/）；
-#   - 版本号 = app/build.gradle.kts 的 appVersionName + "-debug"（如 0.1.28-debug）。
-#
-# 注意：debug 签名与官方发布版签名不同，安装前须先卸载旧版 CarDeck。
-name: Build Debug APK
+name: Android CI
 
 on:
   push:
-    branches: ['**'] # 任何分支推送都出包
-  workflow_dispatch: # 允许在 Actions 页面手动运行
-
-permissions:
-  contents: read
-
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
-    name: 构建 Debug APK
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+
     steps:
-      - name: 检出代码
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # AGP 8.7 要求 JDK 17
-      - name: 安装 JDK 17
+      - name: Relocate root uploaded Kotlin files (if any)
+        run: |
+          [ -f "SessionController.kt" ] && mv -f "SessionController.kt" "app/src/main/java/io/github/shaonialife/cardeck/SessionController.kt" || true
+          [ -f "Iap2LinkEngine.kt" ] && mv -f "Iap2LinkEngine.kt" "app/src/main/java/io/github/shaonialife/cardeck/iap2/Iap2LinkEngine.kt" || true
+          [ -f "Iap2SenderSession.kt" ] && mv -f "Iap2SenderSession.kt" "app/src/main/java/io/github/shaonialife/cardeck/iap2/Iap2SenderSession.kt" || true
+          [ -f "Iap2LinkChannel.kt" ] && mv -f "Iap2LinkChannel.kt" "app/src/main/java/io/github/shaonialife/cardeck/transport/Iap2LinkChannel.kt" || true
+          [ -f "AirPlayClient.kt" ] && mv -f "AirPlayClient.kt" "app/src/main/java/io/github/shaonialife/cardeck/airplay/AirPlayClient.kt" || true
+
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
           java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
 
-      - name: 配置 Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
 
-      - name: 读取版本号
-        id: version
-        run: |
-          set -eu
-          BASE=$(sed -n 's/^val appVersionName = "\(.*\)"/\1/p' app/build.gradle.kts)
-          test -n "$BASE" || BASE="unknown"
-          echo "name=${BASE}-debug" >> "$GITHUB_OUTPUT"
-          echo "本次版本：${BASE}-debug"
+      - name: Build Standard Debug APK
+        run: ./gradlew assembleStandardDebug
 
-      # 不传 -Pcardeck.buildNumber：传了就会强制要求正式 keystore 而失败
-      - name: 构建 Debug APK
-        run: |
-          chmod +x gradlew
-          ./gradlew :app:assembleStandardDebug --stacktrace
-
-      - name: 整理产物
-        id: package
-        env:
-          VERSION: ${{ steps.version.outputs.name }}
-        run: |
-          set -eu
-          APK=$(ls app/build/outputs/apk/standard/debug/*.apk | head -n1)
-          test -f "$APK" || { echo "::error::未找到 APK"; exit 1; }
-          NAME="CarDeck-${VERSION}.apk"
-          cp "$APK" "$NAME"
-          SHA=$(sha256sum "$NAME" | cut -d' ' -f1)
-          SIZE=$(du -h "$NAME" | cut -f1)
-          {
-            echo "name=$NAME"
-            echo "sha=$SHA"
-            echo "size=$SIZE"
-          } >> "$GITHUB_OUTPUT"
-          echo "已生成 $NAME（$SIZE）"
-
-      - name: 上传 APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.name }}
-          path: ${{ steps.package.outputs.name }}
-          if-no-files-found: error
-          retention-days: 30
-          overwrite: 'true'
-
-      - name: 写入运行摘要
-        env:
-          NAME: ${{ steps.package.outputs.name }}
-          SHA: ${{ steps.package.outputs.sha }}
-          SIZE: ${{ steps.package.outputs.size }}
-        run: |
-          set -eu
-          {
-            echo "### ${NAME}（debug 签名）"
-            echo
-            echo "| 项 | 值 |"
-            echo "|---|---|"
-            echo "| APK | ${NAME} |"
-            echo "| 大小 | ${SIZE} |"
-            echo "| SHA-256 | ${SHA} |"
-            echo
-            echo "安装前请先卸载旧版 CarDeck（签名不同无法覆盖安装）。"
-          } >> "$GITHUB_STEP_SUMMARY"
+          name: cardeck-standard-debug-apk
+          path: app/build/outputs/apk/standard/debug/*.apk
