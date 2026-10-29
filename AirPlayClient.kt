@@ -472,7 +472,9 @@ class AirPlayClient(
         failAllPending("控制通道关闭")
         runCatching { iapTunnel?.socket?.close() }
         iapTunnel = null
+        iapLinkGeneration++
         iapLink = null
+        tunnelSawSyncOrData = false
         // 注意：controlIapTx 不在这里 shutdown——close() 会被同实例的重试路径
         // （retryWithPairing 等）复用，杀掉执行器会废掉重连后的 MIB3 出站；
         // 守护线程常驻的代价可忽略（每客户端实例一根）
@@ -1351,46 +1353,38 @@ class AirPlayClient(
     @Volatile
     private var tunnelSawSyncOrData: Boolean = false
 
+    /** 虚拟链路代次：重建/关闭时递增，让旧 VirtualIap2Link 后台节拍线程立即退出，防双实例抢发。 */
+    @Volatile
+    private var iapLinkGeneration: Int = 0
+
     /** 虚拟链路唯一实例（出站路由/三形态语义见 [VirtualIap2Link]）。 */
     private fun obtainIapLink(): VirtualIap2Link =
         iapLink ?: synchronized(this) {
             iapLink
-                ?: VirtualIap2Link(
-                    log = { line -> log(line) },
-                    sendEventIap = ::sendIap,
-                    sendControlIap = ::postControlIap,
-                    tunnelWriter = { iapTunnel },
-                    alive = { socket?.isClosed == false },
-                    mfiContext = context,
-                ).also {
-                    it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
-                    it.onNavKey = { keyCode -> onNavKey?.invoke(keyCode) }
-                    it.onControlSessionComplete = {
-                        mib3ControlSessionDone = true
-                        onTunnelControlSessionComplete?.invoke()
+                ?: run {
+                    val myGen = ++iapLinkGeneration
+                    VirtualIap2Link(
+                        log = { line -> log(line) },
+                        sendEventIap = ::sendIap,
+                        sendControlIap = ::postControlIap,
+                        tunnelWriter = { iapTunnel },
+                        alive = { socket?.isClosed == false && iapLinkGeneration == myGen },
+                        mfiContext = context,
+                    ).also {
+                        it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
+                        it.onNavKey = { keyCode -> onNavKey?.invoke(keyCode) }
+                        it.onControlSessionComplete = {
+                            mib3ControlSessionDone = true
+                            onTunnelControlSessionComplete?.invoke()
+                        }
+                        it.begin()
+                        iapLink = it
                     }
-                    it.begin()
-                    iapLink = it
                 }
         }
 
     /** 车机 iAPSendMessage 字节入口（SessionController 事件命令处理器调用）。 */
     fun onIapEventBytes(data: ByteArray) {
-        val isMarker = data.size == 6 && data[0] == 0xFF.toByte() && data[1] == 0x55.toByte()
-        if (!isMarker && data.size >= 9 && data[0] == 0xFF.toByte() && data[1] == 0x5A.toByte()) {
-            tunnelSawSyncOrData = true
-        } else if (isMarker && tunnelSawSyncOrData && !mib3ControlSessionDone && iapTunnel == null) {
-            log("IAPLINK: 隧道控制会话未完成时车机重发 FF55 marker（车机复位隧道链路）——重建虚拟链路重协商")
-            synchronized(this) {
-                iapLink = null
-                tunnelSawSyncOrData = false
-            }
-            val link = obtainIapLink()
-            link.setGeneration(linkGeneration ?: ReceiverProfile.LinkGeneration.EVENT_LINK)
-            link.armMib3()
-            link.onCarBytes(data)
-            return
-        }
         obtainIapLink().onCarBytes(data)
     }
 
