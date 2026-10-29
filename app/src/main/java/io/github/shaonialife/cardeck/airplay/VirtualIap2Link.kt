@@ -148,6 +148,8 @@ class VirtualIap2Link(
     private var mfiWindowMillis = 0L
     private var mfiChallengeSentAtMs = 0L
     private var mfiFinished = false
+    private var isCinemoOrNewGen = false
+    private var peerDeclaredReceives: Set<Int>? = null
 
     init {
         engine.onEaData = { bytes -> handleEaData(bytes) }
@@ -443,12 +445,15 @@ class VirtualIap2Link(
         val identity = mfiIdentity ?: return
         if (mfiOrder.isEmpty()) {
             mfiMemory = MfiLengthMemory.load(mfiContext, identity)
-            mfiOrder = MfiLengthMemory.orderAttempts(TUNNEL_MFI_BASELINE, mfiMemory)
+            val baseline = if (isCinemoOrNewGen) listOf(32, 20, 16) else TUNNEL_MFI_BASELINE
+            mfiOrder = MfiLengthMemory.orderAttempts(baseline, mfiMemory)
             if (!mfiMemory.isEmpty) {
                 log(
                     "IAPLINK: 隧道 MFi 按车机记忆：${MfiLengthMemory.describe(mfiMemory)}" +
                         " → 本轮顺序 ${mfiOrder.joinToString("/")}B",
                 )
+            } else {
+                log("IAPLINK: 隧道 MFi 无记忆（isCinemoOrNewGen=$isCinemoOrNewGen）→ 本轮顺序 ${mfiOrder.joinToString("/")}B")
             }
         }
         mfiPosition += 1
@@ -546,10 +551,23 @@ class VirtualIap2Link(
                     Iap2Csm
                         .parseParams(frame.body)
                         .associateBy { it.id }
+                val rawAscii = frame.body.decodeToString()
+                val name = params[0]?.value?.decodeToString()?.trimEnd('\u0000').orEmpty()
+                val model = params[1]?.value?.decodeToString()?.trimEnd('\u0000').orEmpty()
+                val manufacturer = params[2]?.value?.decodeToString()?.trimEnd('\u0000').orEmpty()
+                val idCombined = "$name $model $manufacturer".uppercase()
+
+                isCinemoOrNewGen = idCombined.contains("BUICK") ||
+                    idCombined.contains("CADILLAC") ||
+                    idCombined.contains("CHEVROLET") ||
+                    idCombined.contains("SAIC GENERAL MOTORS") ||
+                    idCombined.contains("GENERAL MOTORS") ||
+                    model.equals("E2YB", ignoreCase = true) ||
+                    rawAscii.contains("Cinemo", ignoreCase = true)
+
                 log(
                     "IAPLINK: 隧道 rx 0x1d01 接收端身份 " +
-                        "name=${params[0]?.value?.decodeToString()?.trimEnd('\u0000')} " +
-                        "model=${params[1]?.value?.decodeToString()?.trimEnd('\u0000')}",
+                        "name=$name model=$model mfr=$manufacturer (isCinemoOrNewGen=$isCinemoOrNewGen)",
                 )
                 // 参 6/7 = 车机声明「它会发 / 它可收」的消息清单。媒体键排查就靠这两行：
                 // 若 0x6800/0x6802 不在发送清单里，说明这台车机根本不用 iAP2 HID 送按键，
@@ -565,6 +583,7 @@ class VirtualIap2Link(
                 }
                 params[7]?.value?.let { raw ->
                     val receives = u16List(raw)
+                    peerDeclaredReceives = receives.toSet()
                     log(
                         "IAPLINK: 车机可收清单(${receives.size})=" +
                             receives.joinToString(" ") { "0x%04x".format(it) },
@@ -778,20 +797,26 @@ class VirtualIap2Link(
             }
         sendCsmLocked(
             WIRELESS_SESSION_ID,
-            Iap2Csm.param(0, sessionId.toByteArray(Charsets.UTF_8)),
+            Iap2Csm.param(0, (sessionId + "\u0000").toByteArray(Charsets.UTF_8)),
         )
-        sendCsmLocked(AUX_STATUS_NOTIFICATION, Iap2Csm.param(0x0006, ByteArray(0)))
+        if (peerDeclaredReceives == null || AUX_STATUS_NOTIFICATION in peerDeclaredReceives!!) {
+            sendCsmLocked(AUX_STATUS_NOTIFICATION, Iap2Csm.param(0x0006, ByteArray(0)))
+        }
         sendCsmLocked(
             DEVICE_LANGUAGE,
-            Iap2Csm.param(0, "zh".toByteArray(Charsets.UTF_8)),
+            Iap2Csm.param(0, "zh\u0000".toByteArray(Charsets.UTF_8)),
         )
         sendCsmLocked(DEVICE_TIME, mib3DeviceTimeParams())
         sendCsmLocked(
             DEVICE_INFORMATION_UPDATE,
-            Iap2Csm.param(0, "iPhone".toByteArray(Charsets.UTF_8)),
+            Iap2Csm.param(0, "iPhone\u0000".toByteArray(Charsets.UTF_8)),
         )
-        sendRawCsmLocked(MIB3_START_LOCATION_INFORMATION)
-        sendRawCsmLocked(MIB3_GPRMC_DATA_STATUS)
+        if (peerDeclaredReceives == null || MIB3_START_LOCATION_INFORMATION_ID in peerDeclaredReceives!!) {
+            sendRawCsmLocked(MIB3_START_LOCATION_INFORMATION)
+        }
+        if (peerDeclaredReceives == null || MIB3_GPRMC_DATA_STATUS_ID in peerDeclaredReceives!!) {
+            sendRawCsmLocked(MIB3_GPRMC_DATA_STATUS)
+        }
         log("IAPLINK: MIB3 突发已发（会话标识 $sessionId）——等待车机订阅")
         if (!mib3ControlSessionNotified) {
             mib3ControlSessionNotified = true
@@ -881,7 +906,7 @@ class VirtualIap2Link(
     companion object {
         /** 隧道 MFi 冷启动基线（Frida 真机 20B 优先；顺序会被按车机记忆重排）。 */
         val TUNNEL_MFI_BASELINE = listOf(20, 32, 16)
-        val TUNNEL_MFI_WINDOWS = mapOf(20 to 6_000L, 32 to 3_000L, 16 to 3_000L)
+        val TUNNEL_MFI_WINDOWS = mapOf(20 to 2_000L, 32 to 2_500L, 16 to 2_000L)
         const val TUNNEL_MFI_SILENT_WINDOW_MS = 1_500L
 
         /**
@@ -936,6 +961,8 @@ class VirtualIap2Link(
         const val START_CALL_STATE_UPDATES = 0x4154
         const val START_LIST_UPDATES = 0x4170
         const val LIST_UPDATE = 0x4171
+        const val MIB3_START_LOCATION_INFORMATION_ID = 0xFFFA
+        const val MIB3_GPRMC_DATA_STATUS_ID = 0xFFF0
 
         /** ---- 以下为 Frida 抓包的逐字节常量（MIB3 真机 iPhone → Audi MMI）---- */
         private val HEX_DIGITS = "0123456789abcdef"

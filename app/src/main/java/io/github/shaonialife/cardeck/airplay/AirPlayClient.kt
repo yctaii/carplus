@@ -472,7 +472,9 @@ class AirPlayClient(
         failAllPending("控制通道关闭")
         runCatching { iapTunnel?.socket?.close() }
         iapTunnel = null
+        iapLinkGeneration++
         iapLink = null
+        tunnelSawSyncOrData = false
         // 注意：controlIapTx 不在这里 shutdown——close() 会被同实例的重试路径
         // （retryWithPairing 等）复用，杀掉执行器会废掉重连后的 MIB3 出站；
         // 守护线程常驻的代价可忽略（每客户端实例一根）
@@ -662,22 +664,36 @@ class AirPlayClient(
             "AIRPLAY: 初始 SETUP body=${body.size}B timingPort=${timingServer.port} " +
                 "deviceID=$deviceId 加密=${if (cipher != null) "是" else "否（et=NONE）"}",
         )
-        val (statusLine, responseBody) =
-            try {
-                // 请求 URI 用相对路径 `/setup`（catplay AirPlayRtspClient::initial_setup 同款）：
-                // 部分老固件（210.81 时代）只认相对 URI，发绝对 `rtsp://host:port/` 会 404/400。
-                request(
-                    "SETUP",
-                    "/setup",
-                    body,
-                    contentType = "application/x-apple-binary-plist",
-                )
-            } catch (error: IOException) {
-                log("AIRPLAY: SETUP 失败 - ${error.message}")
-                return null
+        val uriCandidates =
+            listOf(
+                "/setup",
+                "rtsp://${activeHost ?: endpoint.ipAddresses.firstOrNull() ?: "localhost"}/",
+                "/",
+            )
+        var statusLine = ""
+        var responseBody = ByteArray(0)
+        for ((idx, uri) in uriCandidates.withIndex()) {
+            val res =
+                try {
+                    request(
+                        "SETUP",
+                        uri,
+                        body,
+                        contentType = "application/x-apple-binary-plist",
+                    )
+                } catch (error: IOException) {
+                    log("AIRPLAY: SETUP ($uri) 失败 - ${error.message}")
+                    return null
+                }
+            statusLine = res.first
+            responseBody = res.second
+            if (statusLine.contains("200") || statusLine.contains("403")) break
+            if (idx < uriCandidates.size - 1) {
+                log("AIRPLAY: SETUP ($uri) 应答 [$statusLine]——尝试候选 URI ${uriCandidates[idx + 1]}")
             }
+        }
         if (!statusLine.contains("200")) {
-            log("AIRPLAY: SETUP 应答 [$statusLine]（自报 deviceID=$deviceId）")
+            log("AIRPLAY: SETUP 应答 [$statusLine]（自报 deviceID=$deviceId，响应头：${lastResponseHeadOfRequest()}）")
             if (statusLine.contains("403")) {
                 // 403 的两类成因按可能性排序：设备过滤（WinPlay 等「只接受指定
                 // iPhone」）最常见，其次是接收端不接受的配对/信任状态。把本机
@@ -1333,25 +1349,37 @@ class AirPlayClient(
     var mib3ControlSessionDone: Boolean = false
         private set
 
+    /** 隧道事件通道是否已见过车机 FF5A 帧（若此后控制会话未完成却重现 FF55 marker，说明车机复位了隧道链路）。 */
+    @Volatile
+    private var tunnelSawSyncOrData: Boolean = false
+
+    /** 虚拟链路代次：重建/关闭时递增，让旧 VirtualIap2Link 后台节拍线程立即退出，防双实例抢发。 */
+    @Volatile
+    private var iapLinkGeneration: Int = 0
+
     /** 虚拟链路唯一实例（出站路由/三形态语义见 [VirtualIap2Link]）。 */
     private fun obtainIapLink(): VirtualIap2Link =
         iapLink ?: synchronized(this) {
             iapLink
-                ?: VirtualIap2Link(
-                    log = { line -> log(line) },
-                    sendEventIap = ::sendIap,
-                    sendControlIap = ::postControlIap,
-                    tunnelWriter = { iapTunnel },
-                    alive = { socket?.isClosed == false },
-                ).also {
-                    it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
-                    it.onNavKey = { keyCode -> onNavKey?.invoke(keyCode) }
-                    it.onControlSessionComplete = {
-                        mib3ControlSessionDone = true
-                        onTunnelControlSessionComplete?.invoke()
+                ?: run {
+                    val myGen = ++iapLinkGeneration
+                    VirtualIap2Link(
+                        log = { line -> log(line) },
+                        sendEventIap = ::sendIap,
+                        sendControlIap = ::postControlIap,
+                        tunnelWriter = { iapTunnel },
+                        alive = { socket?.isClosed == false && iapLinkGeneration == myGen },
+                        mfiContext = context,
+                    ).also {
+                        it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
+                        it.onNavKey = { keyCode -> onNavKey?.invoke(keyCode) }
+                        it.onControlSessionComplete = {
+                            mib3ControlSessionDone = true
+                            onTunnelControlSessionComplete?.invoke()
+                        }
+                        it.begin()
+                        iapLink = it
                     }
-                    it.begin()
-                    iapLink = it
                 }
         }
 
@@ -2768,7 +2796,7 @@ class AirPlayClient(
         val fields =
             linkedMapOf<String, Any?>(
                 "deviceID" to deviceId,
-                "macAddress" to "aa:bb:cc:dd:ee:ff",
+                "macAddress" to deviceId,
                 "name" to "iPhone",
                 "model" to "iPhone14,2",
                 "osName" to "iPhone OS",
