@@ -50,17 +50,35 @@ object MfiLengthMemory {
         context: Context?,
         identityText: String,
     ): Entry {
+        val entry = loadDirect(context, identityText)
+        if (!entry.isEmpty) return entry
+        // 若隧道侧（identity 带有 " tunnel" 后缀）尚无独立记忆，优先回退继承该车机在蓝牙链路验证成功的长度：
+        // 同一车辆的硬件 MFi 协处理器是同一颗物理芯片，蓝牙侧验证通过的长度理应作为隧道首选
+        if (identityText.endsWith(" tunnel", ignoreCase = true)) {
+            val baseIdentity = identityText.substring(0, identityText.length - " tunnel".length).trim()
+            val baseEntry = loadDirect(context, baseIdentity)
+            if (baseEntry.succeeded != null) {
+                return Entry(succeeded = baseEntry.succeeded)
+            }
+        }
+        return Entry()
+    }
+
+    private fun loadDirect(
+        context: Context?,
+        identityText: String,
+    ): Entry {
         val key = receiverKey(identityText)
         val prefs = prefs(context)
         if (prefs == null) {
             return synchronized(memory) { memory[key] ?: Entry() }
         }
         val ok = prefs.getInt(KEY_OK + key, 0).takeIf { it > 0 }
-        return Entry(
-            succeeded = ok,
-            silent = readLengths(prefs.getString(KEY_SILENT + key, null)),
-            rejected = readLengths(prefs.getString(KEY_REJECTED + key, null)),
-        )
+        val silent = readLengths(prefs.getString(KEY_SILENT + key, null))
+        val rejected = readLengths(prefs.getString(KEY_REJECTED + key, null))
+        val prefEntry = Entry(succeeded = ok, silent = silent, rejected = rejected)
+        if (!prefEntry.isEmpty) return prefEntry
+        return synchronized(memory) { memory[key] ?: Entry() }
     }
 
     fun recordSuccess(
