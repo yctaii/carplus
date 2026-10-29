@@ -178,6 +178,16 @@ class Iap2LinkEngine(
     /** 对端 0x1D01 识别帧（param 7）声明可接收的消息 ID 集合；null = 对端未声明（如单测）。 */
     private var peerDeclaredReceiveIds: Set<Int>? = null
 
+    /**
+     * 对端 0x1D01 是否属于非 MIB3 / Cinemo 栈（MFi AuthV3 EC 身份只接受 32B 挑战）：
+     * VirtualIap2Link 的冷启动基线是 20B 优先，而别克 E2YB（Cinemo）在隧道侧收到 20B 挑战后
+     * 120ms 内会直接把隧道链路复位回 FF55 Detecting 态，并在 ~12s 看门狗到期时拆掉整条 CarPlay 会话
+     * （2026-10-27 171207 日志定谳）。识别到此类车机时：① 预写 MfiLengthMemory 记忆 32B；
+     * ② 若上层首帧 0xAA02 仍发了 20B，在链路层直接升级为 32B 挑战。
+     */
+    private var peerPrefers32ByteMfiChallenge: Boolean = false
+    private var mfiChallengeUpgraded: Boolean = false
+
     /** 诊断：对端在 NORMAL 状态下重置回探测态（连续发 marker）并触发重协商时回调。 */
     var onPeerResetToDetect: (() -> Unit)? = null
 
@@ -355,6 +365,17 @@ class Iap2LinkEngine(
                 ) {
                     // VirtualIap2Link 突发里 0x4E0C/0x4E0A/0x4E09 的 UTF-8 字符串未带尾部 NUL：对严格校验的 Cinemo 栈补齐 \0
                     effective = Iap2Csm.encode(msgId, Iap2Csm.param(0, bytes.copyOfRange(10, bytes.size) + byteArrayOf(0)))
+                }
+                if (msgId == Iap2MessageIds.MFI_REQUEST_CHALLENGE &&
+                    peerPrefers32ByteMfiChallenge &&
+                    !mfiChallengeUpgraded &&
+                    bytes.size == 30
+                ) {
+                    // 兜底防线：若隧道侧首次 0xAA02 仍携带 20B 挑战（总长 30B），对非 MIB3/Cinemo 车机直接升级为 32B，
+                    // 防止车机收到 20B 后立即复位隧道链路并在 ~12s 后拆掉整条 CarPlay 会话
+                    mfiChallengeUpgraded = true
+                    val challenge32 = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+                    effective = Iap2Csm.encode(msgId, Iap2Csm.param(0, challenge32))
                 }
             }
         }
@@ -656,6 +677,40 @@ class Iap2LinkEngine(
                         (0 until recvRaw.size step 2)
                             .map { readU16(recvRaw, it) }
                             .toSet()
+                }
+                val idParts =
+                    listOf(0, 1, 2).mapNotNull { pid ->
+                        params
+                            .firstOrNull { it.id == pid }
+                            ?.value
+                            ?.decodeToString()
+                            ?.trimEnd('\u0000')
+                            ?.takeIf { it.isNotBlank() }
+                    }
+                val idText = idParts.joinToString(" ")
+                val rawAscii = String(payload, Charsets.ISO_8859_1)
+                val isLegacyMib3 =
+                    idText.contains("MIB3", ignoreCase = true) ||
+                        idText.contains("Audi", ignoreCase = true) ||
+                        idText.contains("Delphi", ignoreCase = true) ||
+                        idText.contains("Alpine", ignoreCase = true) ||
+                        idText.contains("Porsche", ignoreCase = true)
+                val isGmOrCinemo =
+                    rawAscii.contains("Cinemo", ignoreCase = true) ||
+                        idText.contains("Buick", ignoreCase = true) ||
+                        idText.contains("Cadillac", ignoreCase = true) ||
+                        idText.contains("Chevrolet", ignoreCase = true) ||
+                        idText.contains("Saic General Motors", ignoreCase = true) ||
+                        idText.contains("General Motors", ignoreCase = true) ||
+                        idText.contains("E2YB", ignoreCase = true)
+                val isCinemoOrNewGen =
+                    isGmOrCinemo ||
+                        (!isLegacyMib3 && peerDeclaredReceiveIds != null && 0x5702 !in peerDeclaredReceiveIds!!)
+                peerPrefers32ByteMfiChallenge = isCinemoOrNewGen
+                mfiChallengeUpgraded = false
+                if (isCinemoOrNewGen && idText.isNotEmpty()) {
+                    MfiLengthMemory.recordSuccess(null, idText, 32)
+                    MfiLengthMemory.recordSuccess(null, "$idText tunnel", 32)
                 }
             }
         }
